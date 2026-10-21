@@ -145,6 +145,35 @@ internal static class IncompleteScanner
         }
     }
 
+    /// <summary>
+    /// 文件夹被「更新文件夹序号」重命名后，同步 incomplete.json 里缓存的路径，
+    /// 避免下次打开「检查所有文件」时仍指向旧目录。
+    /// </summary>
+    public static void Relocate(string outputRoot, IReadOnlyDictionary<string, string> oldToNewPaths)
+    {
+        if (oldToNewPaths.Count == 0) return;
+        try
+        {
+            var items = Load(outputRoot);
+            if (items.Count == 0) return;
+            bool changed = false;
+            foreach (var item in items)
+            {
+                if (oldToNewPaths.TryGetValue(item.FolderPath, out var newPath))
+                {
+                    item.FolderPath = newPath;
+                    item.FolderName = Path.GetFileName(newPath);
+                    changed = true;
+                }
+            }
+            if (changed) Save(outputRoot, items);
+        }
+        catch
+        {
+            // 缓存文件更新失败不影响重命名本身；下次「重新检查」会重建结果。
+        }
+    }
+
     private static List<int> ExpectedPages(ScanManifest? manifest, DownloadLog history)
     {
         if (manifest?.ImageCount > 0) return Enumerable.Range(1, manifest.ImageCount).ToList();

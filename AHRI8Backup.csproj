@@ -20,9 +20,10 @@
     <Product>AHRI8Backup</Product>
     <Description>把漫画镜像站收藏夹里的作品批量备份到本地（单文件、无需安装运行时）</Description>
     <Company>AHRI8Backup</Company>
-    <Version>1.3.0</Version>
-    <FileVersion>1.3.0.0</FileVersion>
-    <AssemblyVersion>1.3.0.0</AssemblyVersion>
+    <Version>1.4.0</Version>
+    <FileVersion>1.4.0.0</FileVersion>
+    <AssemblyVersion>1.4.0.0</AssemblyVersion>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <NeutralLanguage>zh-CN</NeutralLanguage>
 
     <!-- 不生成 AHRI8Backup.exe.config；单文件发布包里只留一个 exe。 -->

@@ -82,6 +82,7 @@ internal static class FolderIntegrity
                 var name = System.IO.Path.GetFileName(path);
                 if (name.Equals(DownloadLog.FileName, StringComparison.OrdinalIgnoreCase)) continue;
                 if (name.Equals("manifest.json", StringComparison.OrdinalIgnoreCase)) continue;
+                if (name.Equals(WorkIdentityStore.FileName, StringComparison.OrdinalIgnoreCase)) continue;   // 作品识别文件，不是残留图片
                 if (name.EndsWith(".part", StringComparison.OrdinalIgnoreCase))
                 {
                     var size = new FileInfo(path).Length;

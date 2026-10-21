@@ -13,9 +13,10 @@ using System.Web.Script.Serialization;
 namespace AHRI8Backup;
 
 /// <summary>
-/// AHRI8 收藏备份工具 v1.3.0（单文件 / 免安装运行时版）
+/// AHRI8 收藏备份工具 v1.4.0（单文件 / 免安装运行时版）
 /// 直连并发下载收藏夹作品：登录 → 扫描收藏夹 → 解析阅读页 → 并发下载图片。
 /// 站点把标题/作者用逐页随机密钥的 AES 加密，本程序在抓取端直接解密，因此目录名是真实标题。
+/// 每部作品文件夹内写入 work-id.json（漫画编号 + 收藏夹位置），用于之后同步目录末尾序号。
 /// </summary>
 public sealed class MainForm : Form
 {
@@ -53,6 +54,10 @@ public sealed class MainForm : Form
     private readonly Button downloadRangeButton = new() { Text = "下载该范围", AutoSize = true };
     private readonly Button checkButton = new() { Text = "检查文件夹完整性", AutoSize = true };
     private readonly Button checkAllButton = new() { Text = "检查所有文件", AutoSize = true };
+    // ---- 作品识别文件：漫画编号 + 收藏夹位置 ----
+    private readonly Button identityButton = new() { Text = "补写识别文件", AutoSize = true };
+    private readonly Button updatePositionButton = new() { Text = "对照更新位置", AutoSize = true };
+    private readonly Button renameFolderButton = new() { Text = "更新文件夹序号", AutoSize = true };
     private readonly NumericUpDown rangeFrom = new() { Minimum = 1, Value = 1, Width = 60 };
     private readonly NumericUpDown rangeTo = new() { Minimum = 1, Value = 1, Width = 60 };
     private const int PageSize = 20;          // 与站点收藏夹每页数量一致
@@ -148,18 +153,18 @@ public sealed class MainForm : Form
         EmbeddedAssemblies.Install();
         LoadSettings();
         EnsureSettingsFile();
-        Text = $"AHRI8 收藏备份工具 v1.3.0（构建 {BuildStamp}）";
+        Text = $"AHRI8 收藏备份工具 v1.4.0（构建 {BuildStamp}）";
         Icon = AppIcon.Load();
         // .NET Framework 4.8 的 HttpClient 默认用系统 TLS 策略；显式打开 TLS 1.2 更稳。
         ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
         ApplyTheme(darkMode.Checked);      // 先定好配色，后面创建控件时才能直接用上正确颜色
-        Width = 1250; Height = 940; MinimumSize = new Size(1000, 740);
+        Width = 1250; Height = 980; MinimumSize = new Size(1000, 740);
         var handler = new HttpClientHandler { CookieContainer = cookies, AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate, AllowAutoRedirect = true, UseCookies = true };
         http = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(60) };
         http.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36");
         http.DefaultRequestHeaders.Accept.ParseAdd("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8");
 
-        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 7, Padding = new Padding(8) };
+        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 8, Padding = new Padding(8) };
         // 设置区每行要放下「输入框 + 说明文字」，高度按当前字体推算，高 DPI 下自动放大。
         int inputH = Font.Height + 8;                 // 单行输入框（含边框）
         int hintH = HintFont.Height + 8;              // 说明行
@@ -167,6 +172,7 @@ public sealed class MainForm : Form
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));   // 命名方式 + 列表翻页
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));   // 按范围 / 本页 / 选中下载
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));   // 识别文件：补写 / 对照 / 重命名
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));   // 三级进度条
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 56));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 44));
@@ -209,6 +215,9 @@ public sealed class MainForm : Form
         pauseButton.Click += async (_, _) => await TogglePauseAsync();
         checkButton.Click += async (_, _) => await RunAsync(CheckFoldersAsync);
         checkAllButton.Click += (_, _) => OpenIncompleteWindow();
+        identityButton.Click += async (_, _) => await RunAsync(CreateIdentityFilesAsync);
+        updatePositionButton.Click += async (_, _) => await RunAsync(UpdateIdentityPositionsAsync);
+        renameFolderButton.Click += async (_, _) => await RunAsync(RenameIdentityFoldersAsync);
         namingMode.SelectedIndexChanged += (_, _) => { SaveSettings(); ShowPage(currentPage); };
         existingMode.SelectedIndexChanged += (_, _) => SaveSettings();
         prevPageButton.Click += (_, _) => ShowPage(currentPage - 1);
@@ -256,19 +265,31 @@ public sealed class MainForm : Form
         });
         root.Controls.Add(batch, 0, 3);
 
+        // 作品识别文件：补写 → 对照更新位置 → 更新文件夹序号
+        var identityRow = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight, WrapContents = false };
+        identityRow.Controls.Add(identityButton);
+        identityRow.Controls.Add(updatePositionButton);
+        identityRow.Controls.Add(renameFolderButton);
+        identityRow.Controls.Add(new Label
+        {
+            Text = "识别文件 work-id.json = 漫画编号 + 收藏夹位置；先补写 → 对照更新位置 → 更新文件夹序号",
+            AutoSize = true, Font = HintFont, ForeColor = Color.FromArgb(0x8A, 0x8A, 0x8A), Margin = new Padding(14, 10, 0, 0),
+        });
+        root.Controls.Add(identityRow, 0, 4);
+
         // 三级进度条
         var progressRow = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight, WrapContents = false };
         progressRow.Controls.Add(fileBar); progressRow.Controls.Add(fileText);
         progressRow.Controls.Add(workBar); progressRow.Controls.Add(workText);
         progressRow.Controls.Add(totalBar); progressRow.Controls.Add(totalText);
-        root.Controls.Add(progressRow, 0, 4);
+        root.Controls.Add(progressRow, 0, 5);
         progressTimer.Tick += (_, _) => RefreshProgress();
 
         list.Columns.Add("序号", 70); list.Columns.Add("作品标题", 220); list.Columns.Add("ID", 76); list.Columns.Add("状态", 122); list.Columns.Add("作品地址", 500);
         list.HeaderStyle = ColumnHeaderStyle.None;   // 原生表头会把未被列占满的部分涂白，干脆不用它
         StyleDarkList();
-        root.Controls.Add(BuildListHost(), 0, 5);
-        root.Controls.Add(log, 0, 6);
+        root.Controls.Add(BuildListHost(), 0, 6);
+        root.Controls.Add(log, 0, 7);
 
         loginButton.Click += async (_, _) => await RunAsync(LoginAsync);
         scanButton.Click += async (_, _) => await RunAsync(ScanFavoritesAsync);
@@ -288,7 +309,7 @@ public sealed class MainForm : Form
 
         ApplyTheme(darkMode.Checked);
         Shown += (_, _) => { ThemeProgressBars(); ThemeComboBoxes(); RefreshProgress(); };   // 句柄建好后给进度条/下拉框上色
-        Log("AHRI8Backup v1.3.0：单文件、免安装运行时（.NET Framework 4.8 为 Windows 10/11 自带）。");
+        Log("AHRI8Backup v1.4.0：单文件、免安装运行时（.NET Framework 4.8 为 Windows 10/11 自带）。");
         // 提前用一次 HTML 解析，确认内嵌的 HtmlAgilityPack 能从 exe 资源里加载；
         // 加载失败时这里就会给出明确日志，而不是等到点“扫描收藏夹”才报错。
         try { Parse("<html><body>ok</body></html>"); Log("内置组件自检：HTML 解析器可用（已从 exe 内嵌资源加载）。"); }
@@ -300,6 +321,8 @@ public sealed class MainForm : Form
         Log("每张图片下载成功后立即追加到该作品文件夹的 download.log.jsonl；下次下载会扫描这份日志继续上次进度。");
         Log("每次下载前还会直接检查已有文件是否损坏（不依赖日志），损坏的会重新下载。按钮「检查文件夹完整性」可手动检查。");
         Log("图片地址 404 时会自动尝试备用宽度/原图/无章节路径；「检查所有文件」可扫描输出目录并单独补下载。");
+        Log("每部作品文件夹内会写入 work-id.json（漫画编号 + 收藏夹页/序号），用于收藏夹变动后同步目录末尾序号。");
+        Log("收藏夹变动后的顺序：扫描收藏夹 → 「对照更新位置」→「更新文件夹序号」。");
         Log("如果每次启动都被 Windows 拦下、要手动点同意，点「修复启动被拦」按钮即可处理。");
     }
 
@@ -628,6 +651,7 @@ public sealed class MainForm : Form
     {
         loginButton.Enabled = scanButton.Enabled = firstPageButton.Enabled = testButton.Enabled = allButton.Enabled = folderButton.Enabled = !busy;
         downloadPageButton.Enabled = downloadSelectedButton.Enabled = downloadRangeButton.Enabled = fixButton.Enabled = !busy;
+        identityButton.Enabled = updatePositionButton.Enabled = renameFolderButton.Enabled = !busy;
         stopButton.Enabled = busy;
         pauseButton.Enabled = busy;
         pauseButton.Text = "暂停";
@@ -783,7 +807,7 @@ public sealed class MainForm : Form
                 if (!string.Equals(path, sessionLogPath, StringComparison.OrdinalIgnoreCase))
                 {
                     sessionLogPath = path;
-                    var line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] ===== AHRI8Backup v1.3.0 运行日志：{path} =====";
+                    var line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] ===== AHRI8Backup v1.4.0 运行日志：{path} =====";
                     File.AppendAllText(sessionLogPath, line + Environment.NewLine, new UTF8Encoding(false));
                 }
             }
@@ -1544,6 +1568,9 @@ public sealed class MainForm : Form
         activeWorks[w.Id] = (0, images.Count);      // 登记到“单文件夹”进度里
         var manifestPath = Path.Combine(folder, "manifest.json");
 
+        // 识别文件要在“全部已存在，本次跳过”提前返回之前写，保证老作品也能补上。
+        WriteWorkIdentity(folder, w, readerUrl, images.Count);
+
         // —— 1) 绕过日志的损坏文件夹检查：每次都直接读文件，不信任 manifest / 下载日志 ——
         FolderIntegrity.DeleteEmptyParts(folder);
         var report = FolderIntegrity.Check(folder, images.Keys);
@@ -1652,6 +1679,32 @@ public sealed class MainForm : Form
         File.Move(manifestTemp, manifestPath);
         SetStatus(w, failed > 0 ? $"失败 {failed} 张" : present.Count > 0 ? $"补全 {downloaded} 张" : "完成");
         Log($"作品完成：{w.Title}；图片 {images.Count} 张（本次下载 {downloaded} 张，已有 {present.Count} 张），失败 {failed} 张；{folder}");
+    }
+
+    /// <summary>
+    /// 写入/刷新作品文件夹里的 work-id.json。
+    /// 位置优先取本次收藏夹扫描列表（<see cref="works"/>）；从「检查所有文件」单独下载时列表里可能没有该作品，
+    /// 这时只补空字段，避免旧的 manifest 位置覆盖已经同步过的识别文件。
+    /// </summary>
+    private void WriteWorkIdentity(string folder, Work w, string readerUrl, int imageCount)
+    {
+        var scanned = works.FirstOrDefault(x => string.Equals(x.Id, w.Id, StringComparison.OrdinalIgnoreCase));
+        var current = scanned ?? w;
+        int globalIndex = scanned is null ? 0 : works.IndexOf(scanned) + 1;
+        int totalWorks = scanned is null ? 0 : works.Count;
+
+        var identity = WorkIdentityStore.WriteDownload(
+            folder, w.Id, current.Title, current.Authors,
+            current.FavoritePage, current.FavoritePosition,
+            globalIndex, totalWorks, w.Url, readerUrl, imageCount,
+            positionIsCurrent: scanned is not null, out bool created);
+        if (identity is null)
+        {
+            Log($"作品 {w.Id}：识别文件写入失败（{WorkIdentityStore.FileName}）。");
+            return;
+        }
+        if (created)
+            Log($"作品 {w.Id}：已写入识别文件 {WorkIdentityStore.FileName}（漫画编号 {identity.WorkId}，位置 {identity.PositionText}）。");
     }
 
     /// <summary>
@@ -1993,11 +2046,83 @@ public sealed class MainForm : Form
         Log($"文件夹完整性检查结束：{complete} 个作品完整，{withProblems} 个需要补全。下次对它们执行下载时会自动跳过可用页、只补下载损坏和缺失的页。");
     }
 
-    /// <summary>
-    /// 检查按钮不联网，无法解析阅读页，所以预期页数只能来自本地：
-    /// manifest.json 的 ImageCount，或下载日志里出现过的页号；两者都没有时返回空集合，
-    /// 由 FolderIntegrity 直接扫目录里的 jpg。
-    /// </summary>
+    // ---------------- 作品识别文件（work-id.json） ----------------
+    /// <summary>把当前扫描列表复制成识别文件服务能用的快照（UI 线程调用，避免后台线程直接读 works）。</summary>
+    private List<IdentityWorkInfo> SnapshotWorks()
+    {
+        var snapshot = new List<IdentityWorkInfo>(works.Count);
+        for (int i = 0; i < works.Count; i++)
+        {
+            var w = works[i];
+            string host = "";
+            try { if (Uri.TryCreate(w.Url, UriKind.Absolute, out var uri)) host = uri.Host; } catch { }
+            snapshot.Add(new IdentityWorkInfo
+            {
+                WorkId = w.Id,
+                Title = w.Title,
+                Authors = w.Authors,
+                FavoritePage = w.FavoritePage,
+                FavoritePosition = w.FavoritePosition,
+                GlobalIndex = i + 1,
+                TotalWorks = works.Count,
+                WorkUrl = w.Url,
+                SiteHost = host,
+            });
+        }
+        return snapshot;
+    }
+
+    /// <summary>给已有作品文件夹补写 work-id.json（优先 manifest.json，必要时按目录后缀对照当前列表）。</summary>
+    private async Task CreateIdentityFilesAsync(CancellationToken ct)
+    {
+        var root = ResolveOutputRoot();
+        var snapshot = SnapshotWorks();
+        Log($"开始补写作品识别文件（{WorkIdentityStore.FileName}）：扫描 {root}");
+        var result = await Task.Run(() => WorkIdentityService.CreateMissing(root, snapshot, Log), ct);
+        Log($"识别文件补写完成：新建 {result.Created} 个，已存在 {result.Existing} 个，跳过 {result.Skipped} 个。");
+        status.Text = $"识别文件：新建 {result.Created} 个";
+    }
+
+    /// <summary>按漫画编号对照当前收藏夹扫描结果，更新识别文件里的页/页内序号/全局序号。</summary>
+    private async Task UpdateIdentityPositionsAsync(CancellationToken ct)
+    {
+        var root = ResolveOutputRoot();
+        if (works.Count == 0) throw new InvalidOperationException("请先扫描收藏夹，再对照更新识别文件里的收藏夹位置。");
+        var snapshot = SnapshotWorks();
+        Log($"开始对照识别文件位置：当前扫描列表共 {works.Count} 部作品（位置以此列表为准）。");
+        var result = await Task.Run(() => WorkIdentityService.UpdatePositions(root, snapshot, Log), ct);
+        Log($"识别文件位置对照完成：匹配 {result.Matched} 部（位置变化 {result.Updated} 部），不在收藏夹 {result.NotInFavorites} 部。");
+        status.Text = $"位置对照：更新 {result.Updated} 部";
+    }
+
+    /// <summary>按更新后的识别文件，只替换作品文件夹末尾的 {页,序} / {倒序号}，保留标题与作者前缀。</summary>
+    private async Task RenameIdentityFoldersAsync(CancellationToken ct)
+    {
+        var root = ResolveOutputRoot();
+        bool reverse = Mode == NamingMode.ReverseNumber;
+        var modeText = reverse ? "倒序编号（最后一本为 1）" : "页-序号（标题{作者}{页,序}）";
+        var answer = MessageBox.Show(this,
+            "将按当前命名方式「" + modeText + "」和每部作品文件夹内 work-id.json 记录的收藏夹位置，\n" +
+            "重命名输出目录下作品文件夹末尾的序号。\n\n" +
+            "· 建议先点「对照更新位置」；没有更新过位置的识别文件会被跳过。\n" +
+            "· 只改末尾序号，标题与作者前缀保持不变。\n" +
+            "· 同一次操作会先用临时名过渡，避免 1→2、2→3 这类互换时撞名。\n\n" +
+            "是否继续？",
+            "更新文件夹序号", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+        if (answer != DialogResult.Yes)
+        {
+            Log("已取消更新文件夹序号。");
+            return;
+        }
+
+        Log($"开始按识别文件更新文件夹序号：命名方式 = {modeText}；输出目录 = {root}");
+        var result = await Task.Run(() => WorkIdentityService.RenameFolders(root, reverse, Log), ct);
+        Log($"文件夹序号更新完成：重命名 {result.Renamed} 个，未变化 {result.Unchanged} 个，跳过 {result.Skipped} 个。");
+        status.Text = $"文件夹序号：重命名 {result.Renamed} 个";
+        ShowPage(currentPage);       // 按新目录名重新计算“已存在/已完整”状态
+        if (incompleteWindow is { IsDisposed: false }) _ = incompleteWindow.ScanAsync();
+    }
+
     /// <summary>「检查所有文件」：打开不完整文件夹窗口（非模态），并立即重新扫描。</summary>
     private void OpenIncompleteWindow()
     {
@@ -2068,6 +2193,11 @@ public sealed class MainForm : Form
         });
     }
 
+    /// <summary>
+    /// 检查按钮不联网，无法解析阅读页，所以预期页数只能来自本地：
+    /// manifest.json 的 ImageCount，或下载日志里出现过的页号；两者都没有时返回空集合，
+    /// 由 FolderIntegrity 直接扫目录里的 jpg。
+    /// </summary>
     private static List<int> ReadExpectedPages(string folder, out string source)
     {
         try
