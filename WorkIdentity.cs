@@ -43,6 +43,12 @@ internal sealed class WorkIdentity
     /// <summary>最近一次对照时是否仍在收藏夹里。</summary>
     public bool InFavorites { get; set; } = true;
 
+    /// <summary>
+    /// 已下载但收藏夹中不存在时使用的连续虚拟编号（10000 起）。
+    /// 0 表示不是虚拟编号；大于 0 时表示该作品当前按“收藏夹缺失”规则排在收藏夹之后。
+    /// </summary>
+    public int VirtualPosition { get; set; }
+
     public string CreatedAt { get; set; } = "";
     public string UpdatedAt { get; set; } = "";
     /// <summary>位置最后一次被扫描结果更新的时间。</summary>
@@ -234,6 +240,10 @@ internal sealed class IdentityUpdateResult
     public int Updated { get; set; }
     public int Unchanged { get; set; }
     public int NotInFavorites { get; set; }
+    /// <summary>不在收藏夹、且本地已有图片的作品数（这些作品会被重新编号）。</summary>
+    public int MissingDownloaded { get; set; }
+    /// <summary>本次实际写入新虚拟位置的作品数（10000 起连续编号）。</summary>
+    public int Renumbered { get; set; }
 }
 
 internal sealed class IdentityRenameResult
@@ -251,6 +261,11 @@ internal sealed class IdentityRenameResult
 /// </summary>
 internal static class WorkIdentityService
 {
+    /// <summary>“已下载但收藏夹中不存在”的作品使用的虚拟编号起点：一万。</summary>
+    public const int VirtualBase = 10000;
+    /// <summary>虚拟编号每页多少部：过 20 部页码 +1、页内序号归 1。</summary>
+    public const int VirtualPageSize = 20;
+
     private static readonly Regex SuffixPattern = new(@"^(?<prefix>.*)\{(?<a>\d+)(?:,(?<b>\d+))?\}\s*$", RegexOptions.Compiled);
     private static readonly Regex ReplaceSuffixPattern = new(@"\{\d+(?:,\d+)?\}\s*$", RegexOptions.Compiled);
 
@@ -342,6 +357,15 @@ internal static class WorkIdentityService
     }
 
     // ---------------- 2) 对照编号更新位置 ----------------
+    /// <summary>
+    /// 按漫画编号对照当前收藏夹扫描结果，更新识别文件里的页/页内序号/全局序号。
+    ///
+    /// 同时检测“已下载但收藏夹中不存在”的作品（从收藏夹里删掉、但本地已有图片）：
+    /// 按漫画编号顺序重新编号，连续编号从 10000 起；每 20 部算一页，
+    /// 页码从 10000 起、页内序号 1–20 归一，过 20 部页码 +1。
+    /// 识别文件里同时保存连续编号（<see cref="WorkIdentity.VirtualPosition"/>）和页-序
+    /// （<see cref="WorkIdentity.FavoritePage"/> / <see cref="WorkIdentity.FavoritePosition"/>）。
+    /// </summary>
     public static IdentityUpdateResult UpdatePositions(string outputRoot, IReadOnlyList<IdentityWorkInfo> currentWorks, Action<string> log)
     {
         var result = new IdentityUpdateResult();
@@ -367,6 +391,8 @@ internal static class WorkIdentityService
         }
         var logged = 0;
         var missingLogged = 0;
+        var notDownloaded = 0;
+        var missing = new List<(string Folder, WorkIdentity Identity)>();
 
         foreach (var folder in SafeDirectories(outputRoot))
         {
@@ -380,15 +406,17 @@ internal static class WorkIdentityService
                 {
                     int oldPage = identity.FavoritePage, oldPosition = identity.FavoritePosition;
                     int oldIndex = identity.GlobalIndex;
+                    bool wasVirtual = identity.VirtualPosition >= VirtualBase;
                     // “位置变化”只看页/页内序号/全局序号；作品总数变化只影响倒序补零位数，不算位置移动。
                     bool positionChanged = oldPage != work.FavoritePage || oldPosition != work.FavoritePosition
-                                           || oldIndex != work.GlobalIndex;
+                                           || oldIndex != work.GlobalIndex || wasVirtual;
                     bool wasMissing = !identity.InFavorites;
 
                     identity.FavoritePage = work.FavoritePage;
                     identity.FavoritePosition = work.FavoritePosition;
                     identity.GlobalIndex = work.GlobalIndex;
                     identity.TotalWorks = work.TotalWorks;
+                    identity.VirtualPosition = 0;               // 重新回到真实收藏夹，清除虚拟编号
                     if (string.IsNullOrWhiteSpace(identity.Title)) identity.Title = work.Title;
                     if (identity.Authors.Count == 0) identity.Authors = work.Authors.ToList();
                     if (string.IsNullOrWhiteSpace(identity.WorkUrl)) identity.WorkUrl = work.WorkUrl;
@@ -399,7 +427,7 @@ internal static class WorkIdentityService
                     identity.PositionUpdatedAt = now;
                     WorkIdentityStore.Write(folder, identity);
                     if (oldPage != identity.FavoritePage || oldPosition != identity.FavoritePosition)
-                        UpdateManifestPosition(folder, identity.FavoritePage, identity.FavoritePosition);
+                        UpdateManifestPosition(folder, identity.FavoritePage, identity.FavoritePosition, 0);
 
                     result.Matched++;
                     if (positionChanged)
@@ -424,17 +452,25 @@ internal static class WorkIdentityService
                 else
                 {
                     result.NotInFavorites++;
-                    if (identity.InFavorites)
+                    var name = Path.GetFileName(folder);
+                    if (!HasDownloadedImages(folder))
                     {
-                        identity.InFavorites = false;
-                        identity.LastSeenAt = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
-                        WorkIdentityStore.Write(folder, identity);
-                        if (missingLogged < 30)
+                        notDownloaded++;
+                        if (missingLogged < 20)
                         {
-                            log($"不在当前收藏夹：{Path.GetFileName(folder)}（漫画编号 {identity.WorkId}），位置保留不变。");
+                            log($"不在当前收藏夹且本地还没有图片：{name}（漫画编号 {identity.WorkId}），不参与编号。");
                             missingLogged++;
                         }
+                        continue;
                     }
+
+                    // 已下载但收藏夹中不存在：先收集，循环结束后统一重新编号。
+                    if (identity.InFavorites && missingLogged < 30)
+                    {
+                        log($"检测到已下载但收藏夹中不存在的作品：{name}（漫画编号 {identity.WorkId}）。");
+                        missingLogged++;
+                    }
+                    missing.Add((folder, identity));
                 }
             }
             catch (Exception ex)
@@ -443,8 +479,67 @@ internal static class WorkIdentityService
             }
         }
 
+        // 统一重新编号：顺序稳定（漫画编号升序），每次对照都按当前集合重算“每 20 部一页”。
+        var ordered = missing
+            .OrderBy(m => int.TryParse(m.Identity.WorkId, out var id) ? id : int.MaxValue)
+            .ThenBy(m => m.Identity.WorkId, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(m => m.Folder, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        result.MissingDownloaded = ordered.Count;
+
+        int renumberLogged = 0;
+        for (int i = 0; i < ordered.Count; i++)
+        {
+            var (folder, identity) = ordered[i];
+            int virtualPosition = VirtualBase + i;
+            int page = VirtualBase + i / VirtualPageSize;     // 第 10000 页第 1 个 = 位置 10000
+            int position = i % VirtualPageSize + 1;           // 页内序号 1–20，过 20 部页码 +1 后归 1
+            var now = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+
+            bool changed = identity.VirtualPosition != virtualPosition
+                           || identity.FavoritePage != page
+                           || identity.FavoritePosition != position
+                           || identity.InFavorites;
+
+            identity.VirtualPosition = virtualPosition;
+            identity.FavoritePage = page;
+            identity.FavoritePosition = position;
+            identity.GlobalIndex = 0;        // 虚拟编号不属于真实收藏夹，倒序编号时不参与计算
+            identity.InFavorites = false;
+            identity.PositionUpdatedAt = now;
+            WorkIdentityStore.Write(folder, identity);
+            if (changed) UpdateManifestPosition(folder, page, position, virtualPosition);
+
+            if (changed)
+            {
+                result.Renumbered++;
+                if (renumberLogged < 40)
+                {
+                    log($"收藏夹缺失作品编号：{Path.GetFileName(folder)}（漫画编号 {identity.WorkId}）→ 连续编号 {virtualPosition}，页-序 {page},{position}。");
+                    renumberLogged++;
+                }
+                else if (renumberLogged == 40)
+                {
+                    log("……其余收藏夹缺失作品的编号已写入各自的 work-id.json。");
+                    renumberLogged++;
+                }
+            }
+        }
+
+        if (ordered.Count == 0)
+        {
+            log("检测完成：没有发现“已下载但收藏夹中不存在”的作品。");
+        }
+        else
+        {
+            log($"检测完成：已下载但收藏夹中不存在 {ordered.Count} 部，已从 {VirtualBase} 起连续编号（本次写入 {result.Renumbered} 部）；" +
+                $"每 {VirtualPageSize} 部一页，页码从 {VirtualBase} 起、页内序号 1–{VirtualPageSize} 归一。");
+        }
+        if (notDownloaded > 0)
+            log($"另有 {notDownloaded} 部不在收藏夹、但本地还没有图片，未参与编号。");
+
         log($"位置对照完成：匹配 {result.Matched} 部，其中位置变化 {result.Updated} 部、未变化 {result.Unchanged} 部；不在收藏夹 {result.NotInFavorites} 部。");
-        log("提示：下一步点「更新文件夹序号」，才会真正修改本地文件夹名。");
+        log("提示：下一步点「更新文件夹序号」，才会真正修改本地文件夹名（收藏夹缺失作品同样会改名）。");
         return result;
     }
 
@@ -471,16 +566,30 @@ internal static class WorkIdentityService
             {
                 var identity = WorkIdentityStore.TryRead(folder);
                 if (identity is null) continue;
-                if (!identity.InFavorites)
+
+                // 收藏夹中不存在的作品也可以改名：它们由「对照更新位置」分配了 10000 起的虚拟编号。
+                // 还没分配过虚拟编号的（旧数据）先跳过，提示用户先对照。
+                bool isVirtual = identity.VirtualPosition >= VirtualBase;
+                if (!identity.InFavorites && !isVirtual)
                 {
                     result.Skipped++;
+                    if (logged < 20)
+                    {
+                        log($"跳过 {oldName}：不在收藏夹且尚未重新编号，请先点「对照更新位置」。");
+                        logged++;
+                    }
                     continue;
                 }
 
                 string suffix;
                 if (reverseNumber)
                 {
-                    if (identity.TotalWorks <= 0 || identity.GlobalIndex <= 0)
+                    if (!identity.InFavorites && isVirtual)
+                    {
+                        // 倒序编号方式下，收藏夹缺失作品直接使用连续虚拟编号 {10000}、{10001}…
+                        suffix = "{" + identity.VirtualPosition + "}";
+                    }
+                    else if (identity.TotalWorks <= 0 || identity.GlobalIndex <= 0)
                     {
                         result.Skipped++;
                         if (logged < 20)
@@ -490,13 +599,16 @@ internal static class WorkIdentityService
                         }
                         continue;
                     }
-                    int reverse = identity.TotalWorks - identity.GlobalIndex + 1;
-                    if (reverse <= 0)
+                    else
                     {
-                        result.Skipped++;
-                        continue;
+                        int reverse = identity.TotalWorks - identity.GlobalIndex + 1;
+                        if (reverse <= 0)
+                        {
+                            result.Skipped++;
+                            continue;
+                        }
+                        suffix = "{" + reverse.ToString().PadLeft(identity.TotalWorks.ToString().Length, '0') + "}";
                     }
-                    suffix = "{" + reverse.ToString().PadLeft(identity.TotalWorks.ToString().Length, '0') + "}";
                 }
                 else
                 {
@@ -670,6 +782,21 @@ internal static class WorkIdentityService
         catch { return Array.Empty<string>(); }
     }
 
+    /// <summary>本地文件夹里是否已有至少一张图片：用来区分“已下载但收藏夹中不存在”和还没下载的空文件夹。</summary>
+    private static bool HasDownloadedImages(string folder)
+    {
+        try
+        {
+            foreach (var file in Directory.EnumerateFiles(folder))
+                if (ImageIntegrity.IsSupportedExtension(Path.GetExtension(file))) return true;
+        }
+        catch
+        {
+            // 读不到目录时按“没有图片”处理，避免给未下载的作品编号。
+        }
+        return false;
+    }
+
     private static IdentityWorkInfo? MatchWork(WorkManifestSnapshot? manifest, string folderName, IReadOnlyList<IdentityWorkInfo> works)
     {
         if (works.Count == 0) return null;
@@ -766,7 +893,7 @@ internal static class WorkIdentityService
     /// 只改 manifest.json 里的收藏夹位置字段；用字典方式读写以保留 Images 等未知字段。
     /// 失败不影响识别文件（识别文件才是位置同步的主数据）。
     /// </summary>
-    private static void UpdateManifestPosition(string folder, int page, int position)
+    private static void UpdateManifestPosition(string folder, int page, int position, int virtualPosition)
     {
         try
         {
@@ -777,6 +904,8 @@ internal static class WorkIdentityService
             if (data is null) return;
             data["FavoritePage"] = page;
             data["FavoritePosition"] = position;
+            data["VirtualPosition"] = virtualPosition;
+            data["InFavorites"] = virtualPosition < VirtualBase;
             data["PositionUpdatedAt"] = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
             var temp = path + ".tmp";
             File.WriteAllText(temp, JsonFormat.Pretty(serializer.Serialize(data)), new UTF8Encoding(false));

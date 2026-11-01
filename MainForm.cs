@@ -13,7 +13,7 @@ using System.Web.Script.Serialization;
 namespace AHRI8Backup;
 
 /// <summary>
-/// AHRI8 收藏备份工具 v1.4.0（单文件 / 免安装运行时版）
+/// AHRI8 收藏备份工具 v1.5.0（单文件 / 免安装运行时版）
 /// 直连并发下载收藏夹作品：登录 → 扫描收藏夹 → 解析阅读页 → 并发下载图片。
 /// 站点把标题/作者用逐页随机密钥的 AES 加密，本程序在抓取端直接解密，因此目录名是真实标题。
 /// 每部作品文件夹内写入 work-id.json（漫画编号 + 收藏夹位置），用于之后同步目录末尾序号。
@@ -132,6 +132,8 @@ public sealed class MainForm : Form
     private readonly List<Work> works = new();
     private CancellationTokenSource? activeCts;
     private bool authenticated;
+    // 列表是否来自“扫描收藏夹”的完整扫描；只扫第一页时为 false，用于防止把未扫到的作品误判为收藏夹缺失。
+    private bool scanComplete;
 
     // ---- 暂停 / 继续 ----
     // 用 ManualResetEventSlim 作为“闸门”：Set = 运行，Reset = 暂停。
@@ -153,7 +155,7 @@ public sealed class MainForm : Form
         EmbeddedAssemblies.Install();
         LoadSettings();
         EnsureSettingsFile();
-        Text = $"AHRI8 收藏备份工具 v1.4.0（构建 {BuildStamp}）";
+        Text = $"AHRI8 收藏备份工具 v1.5.0（构建 {BuildStamp}）";
         Icon = AppIcon.Load();
         // .NET Framework 4.8 的 HttpClient 默认用系统 TLS 策略；显式打开 TLS 1.2 更稳。
         ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
@@ -272,7 +274,7 @@ public sealed class MainForm : Form
         identityRow.Controls.Add(renameFolderButton);
         identityRow.Controls.Add(new Label
         {
-            Text = "识别文件 work-id.json = 漫画编号 + 收藏夹位置；先补写 → 对照更新位置 → 更新文件夹序号",
+            Text = "识别文件 work-id.json = 漫画编号 + 收藏夹位置；先补写 → 对照更新位置（缺失作品一万起编号）→ 更新文件夹序号",
             AutoSize = true, Font = HintFont, ForeColor = Color.FromArgb(0x8A, 0x8A, 0x8A), Margin = new Padding(14, 10, 0, 0),
         });
         root.Controls.Add(identityRow, 0, 4);
@@ -309,7 +311,7 @@ public sealed class MainForm : Form
 
         ApplyTheme(darkMode.Checked);
         Shown += (_, _) => { ThemeProgressBars(); ThemeComboBoxes(); RefreshProgress(); };   // 句柄建好后给进度条/下拉框上色
-        Log("AHRI8Backup v1.4.0：单文件、免安装运行时（.NET Framework 4.8 为 Windows 10/11 自带）。");
+        Log("AHRI8Backup v1.5.0：单文件、免安装运行时（.NET Framework 4.8 为 Windows 10/11 自带）。");
         // 提前用一次 HTML 解析，确认内嵌的 HtmlAgilityPack 能从 exe 资源里加载；
         // 加载失败时这里就会给出明确日志，而不是等到点“扫描收藏夹”才报错。
         try { Parse("<html><body>ok</body></html>"); Log("内置组件自检：HTML 解析器可用（已从 exe 内嵌资源加载）。"); }
@@ -322,6 +324,7 @@ public sealed class MainForm : Form
         Log("每次下载前还会直接检查已有文件是否损坏（不依赖日志），损坏的会重新下载。按钮「检查文件夹完整性」可手动检查。");
         Log("图片地址 404 时会自动尝试备用宽度/原图/无章节路径；「检查所有文件」可扫描输出目录并单独补下载。");
         Log("每部作品文件夹内会写入 work-id.json（漫画编号 + 收藏夹页/序号），用于收藏夹变动后同步目录末尾序号。");
+        Log("「对照更新位置」还会检测“已下载但收藏夹中不存在”的作品：从 10000 起连续编号，每 20 部一页，页内序号 1–20 归一；点「更新文件夹序号」完成改名。");
         Log("收藏夹变动后的顺序：扫描收藏夹 → 「对照更新位置」→「更新文件夹序号」。");
         Log("如果每次启动都被 Windows 拦下、要手动点同意，点「修复启动被拦」按钮即可处理。");
     }
@@ -807,7 +810,7 @@ public sealed class MainForm : Form
                 if (!string.Equals(path, sessionLogPath, StringComparison.OrdinalIgnoreCase))
                 {
                     sessionLogPath = path;
-                    var line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] ===== AHRI8Backup v1.4.0 运行日志：{path} =====";
+                    var line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] ===== AHRI8Backup v1.5.0 运行日志：{path} =====";
                     File.AppendAllText(sessionLogPath, line + Environment.NewLine, new UTF8Encoding(false));
                 }
             }
@@ -1054,6 +1057,7 @@ public sealed class MainForm : Form
         }
 
         ReplaceWorkList(all.Values);
+        scanComplete = true;
         status.Text = $"发现 {all.Count} 部";
         Log($"扫描完成：{pages} 个收藏页，发现 {all.Count} 部作品。请先核对数量和标题。");
         if (all.Count == 0) Log("未找到作品。若诊断显示页面标题是登录页，说明登录 Cookie 未生效；否则请把“收藏页诊断”一行发来继续适配 DOM。");
@@ -1089,6 +1093,7 @@ public sealed class MainForm : Form
             return;
         }
         ReplaceWorkList(pageWorks);
+        scanComplete = false;
         status.Text = $"第一页发现 {pageWorks.Count} 部";
         Log("第一页作品已加入可下载列表；可选择一部测试下载，或直接并发下载全部。");
     }
@@ -2088,11 +2093,27 @@ public sealed class MainForm : Form
     {
         var root = ResolveOutputRoot();
         if (works.Count == 0) throw new InvalidOperationException("请先扫描收藏夹，再对照更新识别文件里的收藏夹位置。");
+        if (!scanComplete)
+        {
+            var answer = MessageBox.Show(this,
+                "当前作品列表不是完整的收藏夹扫描（例如「扫描并加入第一页作品」只包含第一页）。\n" +
+                "直接对照会把没有扫描到的已下载作品误判为“收藏夹中不存在”，并从 10000 起重新编号。\n\n" +
+                "建议先点「扫描收藏夹」扫完整再对照。仍要按当前列表继续吗？",
+                "确认收藏夹列表完整", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+            if (answer != DialogResult.Yes)
+            {
+                Log("已取消位置对照：请先点「扫描收藏夹」完整扫描。");
+                return;
+            }
+        }
         var snapshot = SnapshotWorks();
         Log($"开始对照识别文件位置：当前扫描列表共 {works.Count} 部作品（位置以此列表为准）。");
+        Log("同时检测“已下载但收藏夹中不存在”的作品：从 10000 起连续编号，每 20 部一页，页内序号 1–20 归一。");
         var result = await Task.Run(() => WorkIdentityService.UpdatePositions(root, snapshot, Log), ct);
-        Log($"识别文件位置对照完成：匹配 {result.Matched} 部（位置变化 {result.Updated} 部），不在收藏夹 {result.NotInFavorites} 部。");
-        status.Text = $"位置对照：更新 {result.Updated} 部";
+        Log($"识别文件位置对照完成：匹配 {result.Matched} 部（位置变化 {result.Updated} 部）；不在收藏夹 {result.NotInFavorites} 部，其中已下载并重新编号 {result.Renumbered} 部（连续编号从 10000 起）。");
+        status.Text = result.MissingDownloaded > 0
+            ? $"位置对照：更新 {result.Updated} 部，缺失重编号 {result.MissingDownloaded} 部"
+            : $"位置对照：更新 {result.Updated} 部";
     }
 
     /// <summary>按更新后的识别文件，只替换作品文件夹末尾的 {页,序} / {倒序号}，保留标题与作者前缀。</summary>
@@ -2105,6 +2126,7 @@ public sealed class MainForm : Form
             "将按当前命名方式「" + modeText + "」和每部作品文件夹内 work-id.json 记录的收藏夹位置，\n" +
             "重命名输出目录下作品文件夹末尾的序号。\n\n" +
             "· 建议先点「对照更新位置」；没有更新过位置的识别文件会被跳过。\n" +
+            "· 收藏夹中不存在的作品按虚拟编号改名：页-序号 {10000,1}…{10000,20}、{10001,1}…；倒序编号 {10000}、{10001}…。\n" +
             "· 只改末尾序号，标题与作者前缀保持不变。\n" +
             "· 同一次操作会先用临时名过渡，避免 1→2、2→3 这类互换时撞名。\n\n" +
             "是否继续？",
