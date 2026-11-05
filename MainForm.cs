@@ -13,7 +13,7 @@ using System.Web.Script.Serialization;
 namespace AHRI8Backup;
 
 /// <summary>
-/// AHRI8 收藏备份工具 v1.5.0（单文件 / 免安装运行时版）
+/// AHRI8 收藏备份工具 v1.6.0（单文件 / 免安装运行时版）
 /// 直连并发下载收藏夹作品：登录 → 扫描收藏夹 → 解析阅读页 → 并发下载图片。
 /// 站点把标题/作者用逐页随机密钥的 AES 加密，本程序在抓取端直接解密，因此目录名是真实标题。
 /// 每部作品文件夹内写入 work-id.json（漫画编号 + 收藏夹位置），用于之后同步目录末尾序号。
@@ -54,6 +54,7 @@ public sealed class MainForm : Form
     private readonly Button downloadRangeButton = new() { Text = "下载该范围", AutoSize = true };
     private readonly Button checkButton = new() { Text = "检查文件夹完整性", AutoSize = true };
     private readonly Button checkAllButton = new() { Text = "检查所有文件", AutoSize = true };
+    private readonly Button cleanExtraButton = new() { Text = "清理多余图片", AutoSize = true };
     // ---- 作品识别文件：漫画编号 + 收藏夹位置 ----
     private readonly Button identityButton = new() { Text = "补写识别文件", AutoSize = true };
     private readonly Button updatePositionButton = new() { Text = "对照更新位置", AutoSize = true };
@@ -155,7 +156,7 @@ public sealed class MainForm : Form
         EmbeddedAssemblies.Install();
         LoadSettings();
         EnsureSettingsFile();
-        Text = $"AHRI8 收藏备份工具 v1.5.0（构建 {BuildStamp}）";
+        Text = $"AHRI8 收藏备份工具 v1.6.0（构建 {BuildStamp}）";
         Icon = AppIcon.Load();
         // .NET Framework 4.8 的 HttpClient 默认用系统 TLS 策略；显式打开 TLS 1.2 更稳。
         ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
@@ -217,6 +218,7 @@ public sealed class MainForm : Form
         pauseButton.Click += async (_, _) => await TogglePauseAsync();
         checkButton.Click += async (_, _) => await RunAsync(CheckFoldersAsync);
         checkAllButton.Click += (_, _) => OpenIncompleteWindow();
+        cleanExtraButton.Click += async (_, _) => await RunAsync(CleanExtraImagesAsync);
         identityButton.Click += async (_, _) => await RunAsync(CreateIdentityFilesAsync);
         updatePositionButton.Click += async (_, _) => await RunAsync(UpdateIdentityPositionsAsync);
         renameFolderButton.Click += async (_, _) => await RunAsync(RenameIdentityFoldersAsync);
@@ -260,6 +262,7 @@ public sealed class MainForm : Form
         batch.Controls.Add(downloadRangeButton);
         batch.Controls.Add(checkButton);
         batch.Controls.Add(checkAllButton);
+        batch.Controls.Add(cleanExtraButton);
         batch.Controls.Add(new Label
         {
             Text = "序号见首列；范围默认=当前页",
@@ -311,7 +314,7 @@ public sealed class MainForm : Form
 
         ApplyTheme(darkMode.Checked);
         Shown += (_, _) => { ThemeProgressBars(); ThemeComboBoxes(); RefreshProgress(); };   // 句柄建好后给进度条/下拉框上色
-        Log("AHRI8Backup v1.5.0：单文件、免安装运行时（.NET Framework 4.8 为 Windows 10/11 自带）。");
+        Log("AHRI8Backup v1.6.0：单文件、免安装运行时（.NET Framework 4.8 为 Windows 10/11 自带）。");
         // 提前用一次 HTML 解析，确认内嵌的 HtmlAgilityPack 能从 exe 资源里加载；
         // 加载失败时这里就会给出明确日志，而不是等到点“扫描收藏夹”才报错。
         try { Parse("<html><body>ok</body></html>"); Log("内置组件自检：HTML 解析器可用（已从 exe 内嵌资源加载）。"); }
@@ -323,6 +326,7 @@ public sealed class MainForm : Form
         Log("每张图片下载成功后立即追加到该作品文件夹的 download.log.jsonl；下次下载会扫描这份日志继续上次进度。");
         Log("每次下载前还会直接检查已有文件是否损坏（不依赖日志），损坏的会重新下载。按钮「检查文件夹完整性」可手动检查。");
         Log("图片地址 404 时会自动尝试备用宽度/原图/无章节路径；「检查所有文件」可扫描输出目录并单独补下载。");
+        Log("「清理多余图片」会扫描所有作品文件夹，自动删除页号超出应有张数、同页重复扩展名的多余图片。");
         Log("每部作品文件夹内会写入 work-id.json（漫画编号 + 收藏夹页/序号），用于收藏夹变动后同步目录末尾序号。");
         Log("「对照更新位置」还会检测“已下载但收藏夹中不存在”的作品：从 10000 起连续编号，每 20 部一页，页内序号 1–20 归一；点「更新文件夹序号」完成改名。");
         Log("收藏夹变动后的顺序：扫描收藏夹 → 「对照更新位置」→「更新文件夹序号」。");
@@ -810,7 +814,7 @@ public sealed class MainForm : Form
                 if (!string.Equals(path, sessionLogPath, StringComparison.OrdinalIgnoreCase))
                 {
                     sessionLogPath = path;
-                    var line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] ===== AHRI8Backup v1.5.0 运行日志：{path} =====";
+                    var line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] ===== AHRI8Backup v1.6.0 运行日志：{path} =====";
                     File.AppendAllText(sessionLogPath, line + Environment.NewLine, new UTF8Encoding(false));
                 }
             }
@@ -2043,12 +2047,100 @@ public sealed class MainForm : Form
                 (report.DamagedPages.Count > 0 ? $"，损坏 {report.DamagedPages.Count} 张（{DescribePages(report.DamagedPages)}）" : "") +
                 (report.MissingPages.Count > 0 ? $"，缺失 {report.MissingPages.Count} 张（{DescribePages(report.MissingPages)}）" : "") + "。");
             foreach (var stray in report.StrayFiles.Take(8)) Log($"  额外文件：{stray}");
+            if (report.ExtraImages.Count > 0)
+                Log($"  发现 {report.ExtraImages.Count} 张多余图片（页号超出应有张数或同页重复扩展名），可点「清理多余图片」自动删除。");
             if (report.DamagedPages.Count > 0)
                 Log("  损坏文件不会被当作已完成；下次下载时会先删除它们再重新下载（本次仅检查，未改动文件）。");
             await Task.Yield();
         }
 
         Log($"文件夹完整性检查结束：{complete} 个作品完整，{withProblems} 个需要补全。下次对它们执行下载时会自动跳过可用页、只补下载损坏和缺失的页。");
+    }
+
+    /// <summary>
+    /// 「清理多余图片」按钮：扫描输出目录下所有作品文件夹，自动删除“多余下载图片”：
+    /// 1. 页号超过 manifest.json / 下载日志记录的应有张数（例如应有 20 张却存在 0021.jpg）；
+    /// 2. 同一页有多个扩展名的重复图片（例如 0007.jpg 与 0007.gif 并存，只保留能通过校验的那一个）。
+    /// .part、manifest.json、download.log.jsonl、work-id.json 不会被删除。
+    /// </summary>
+    private async Task CleanExtraImagesAsync(CancellationToken ct)
+    {
+        var root = ResolveOutputRoot();
+        if (!Directory.Exists(root)) throw new InvalidOperationException("输出目录不存在：" + root);
+
+        List<string> folders;
+        try
+        {
+            folders = Directory.EnumerateDirectories(root)
+                .Where(d => !Path.GetFileName(d).StartsWith("_", StringComparison.Ordinal))
+                .OrderBy(d => d, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException("无法读取输出目录：" + ex.Message);
+        }
+        if (folders.Count == 0)
+        {
+            Log("输出目录下没有作品文件夹，不需要清理。");
+            return;
+        }
+
+        var answer = MessageBox.Show(this,
+            $"将检查输出目录下 {folders.Count} 个作品文件夹，并自动删除“多余下载图片”：\n" +
+            "· 页号超过 manifest.json 记录的应有张数（例如应有 20 张却存在 0021.jpg）；\n" +
+            "· 同一页有多个扩展名的图片（只保留能通过校验的一个，删除重复的旧文件）。\n\n" +
+            "不会删除 .part、manifest.json、download.log.jsonl、work-id.json。\n是否继续？",
+            "清理多余图片", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+        if (answer != DialogResult.Yes)
+        {
+            Log("已取消清理多余图片。");
+            return;
+        }
+
+        Log($"开始检查并清理多余下载图片：{folders.Count} 个作品文件夹（输出目录 {root}）。");
+        int scanned = 0, withExtra = 0, deletedFiles = 0, skipped = 0;
+
+        await Task.Run(() =>
+        {
+            foreach (var folder in folders)
+            {
+                ct.ThrowIfCancellationRequested();
+                scanned++;
+                var name = Path.GetFileName(folder);
+                try
+                {
+                    var expected = ReadExpectedPages(folder, out var source);
+                    if (expected.Count == 0)
+                    {
+                        skipped++;
+                        Log($"跳过 {name}：没有 manifest.json 或下载日志，无法判断应有张数。");
+                        continue;
+                    }
+
+                    var report = FolderIntegrity.Check(folder, expected);
+                    if (report.ExtraImages.Count == 0) continue;
+
+                    withExtra++;
+                    int deleted = FolderIntegrity.DeleteExtraImages(folder, report);
+                    deletedFiles += deleted;
+                    var shown = string.Join("、", report.ExtraImages.Take(8));
+                    if (report.ExtraImages.Count > 8) shown += $" …（共 {report.ExtraImages.Count} 张）";
+                    Log($"清理 {name}：删除 {deleted} 张多余图片（{shown}）；应有 {report.Expected} 张，依据 {source}。");
+                    if (deleted < report.ExtraImages.Count)
+                        Log($"  有 {report.ExtraImages.Count - deleted} 张删除失败（可能被占用或只读），下次清理会再试。");
+                }
+                catch (Exception ex)
+                {
+                    Log($"清理 {name} 失败：{ex.Message}");
+                }
+            }
+        }, ct);
+
+        Log($"清理完成：检查 {scanned} 个文件夹，{withExtra} 个发现多余图片，共删除 {deletedFiles} 张；{skipped} 个文件夹因缺少 manifest/日志被跳过。");
+        status.Text = $"清理多余图片：删除 {deletedFiles} 张";
+        ShowPage(currentPage);
+        if (incompleteWindow is { IsDisposed: false }) _ = incompleteWindow.ScanAsync();
     }
 
     // ---------------- 作品识别文件（work-id.json） ----------------

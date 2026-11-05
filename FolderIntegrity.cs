@@ -14,6 +14,8 @@ internal sealed class FolderReport
     public List<string> DamagedFiles { get; } = new();
     public List<int> MissingPages { get; } = new();
     public List<string> StrayFiles { get; } = new();
+    /// <summary>多余下载图片（页号超出应有张数、同一页重复扩展名的旧文件）；「清理多余图片」会删除它们。</summary>
+    public List<string> ExtraImages { get; } = new();
 
     public bool Complete => Expected > 0 && ValidPages.Count == Expected;
     public int ProblemCount => DamagedPages.Count + MissingPages.Count;
@@ -38,22 +40,59 @@ internal static class FolderIntegrity
         if (!Directory.Exists(folder)) return report;
 
         var recognized = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var extra = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         if (expected.Count > 0)
         {
+            var expectedSet = new HashSet<int>(expected);
+            var filesByPage = new Dictionary<int, List<string>>();
+            // 先按页号归类所有受支持图片：页号超出应有张数的就是多余下载。
+            foreach (var path in EnumerateSupportedImages(folder))
+            {
+                var name = System.IO.Path.GetFileName(path);
+                var stem = System.IO.Path.GetFileNameWithoutExtension(path);
+                if (!int.TryParse(stem, out var page) || page <= 0)
+                {
+                    // 不是 0001 这样的页号文件名：不自动删除，只在日志里提示。
+                    report.StrayFiles.Add(name + "（文件名不是页号，未自动清理）");
+                    continue;
+                }
+                if (!expectedSet.Contains(page))
+                {
+                    report.ExtraImages.Add(name);
+                    extra.Add(name);
+                    continue;
+                }
+                if (!filesByPage.TryGetValue(page, out var list)) filesByPage[page] = list = new List<string>();
+                list.Add(path);
+            }
+
             foreach (var page in expected)
             {
-                var file = ImageIntegrity.FindPageFile(folder, page);
-                if (file is null)
+                if (!filesByPage.TryGetValue(page, out var candidates) || candidates.Count == 0)
                 {
                     report.MissingPages.Add(page);
                     continue;
                 }
-                recognized.Add(System.IO.Path.GetFileName(file));
-                if (ImageIntegrity.Validate(file, out _, out _)) report.ValidPages.Add(page);
+                // 同一页有多个扩展名时：优先保留能通过校验的文件，其余都算重复下载的旧文件。
+                candidates = candidates
+                    .OrderBy(ExtensionPriority)
+                    .ThenBy(p => p, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+                var valid = candidates.FirstOrDefault(p => ImageIntegrity.Validate(p, out _, out _));
+                var keep = valid ?? candidates[0];
+                recognized.Add(System.IO.Path.GetFileName(keep));
+                if (valid is not null) report.ValidPages.Add(page);
                 else
                 {
                     report.DamagedPages.Add(page);
-                    report.DamagedFiles.Add(System.IO.Path.GetFileName(file));
+                    report.DamagedFiles.Add(System.IO.Path.GetFileName(keep));
+                }
+                foreach (var path in candidates)
+                {
+                    if (string.Equals(path, keep, StringComparison.OrdinalIgnoreCase)) continue;
+                    var name = System.IO.Path.GetFileName(path);
+                    report.ExtraImages.Add(name);
+                    extra.Add(name);
                 }
             }
         }
@@ -90,6 +129,7 @@ internal static class FolderIntegrity
                     continue;
                 }
                 if (recognized.Contains(name)) continue;
+                if (extra.Contains(name)) continue;
                 report.StrayFiles.Add(name);
             }
         }
@@ -107,6 +147,38 @@ internal static class FolderIntegrity
         {
             if (ImageIntegrity.IsSupportedExtension(System.IO.Path.GetExtension(path))) yield return path;
         }
+    }
+
+    /// <summary>同页多扩展名时保留哪个：按 .jpg / .jpeg / .png / .gif / .webp 的优先级。</summary>
+    private static int ExtensionPriority(string path)
+    {
+        var extension = System.IO.Path.GetExtension(path);
+        for (int i = 0; i < ImageIntegrity.SupportedExtensions.Length; i++)
+            if (string.Equals(ImageIntegrity.SupportedExtensions[i], extension, StringComparison.OrdinalIgnoreCase)) return i;
+        return int.MaxValue;
+    }
+
+    /// <summary>删除多余下载图片（页号超出应有张数、同页重复扩展名的旧文件）。</summary>
+    public static int DeleteExtraImages(string folder, FolderReport report)
+    {
+        int deleted = 0;
+        foreach (var name in report.ExtraImages)
+        {
+            try
+            {
+                var path = System.IO.Path.Combine(folder, name);
+                if (File.Exists(path))
+                {
+                    File.Delete(path);
+                    deleted++;
+                }
+            }
+            catch
+            {
+                // 删除失败（被占用 / 只读）就保留文件，下次再清理。
+            }
+        }
+        return deleted;
     }
 
     /// <summary>删除损坏的正式图片，保留 .part 供下次 Range 续传。</summary>
